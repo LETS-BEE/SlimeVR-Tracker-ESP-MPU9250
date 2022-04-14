@@ -1,6 +1,7 @@
 /*
     SlimeVR Code is placed under the MIT license
-    Copyright (c) 2021 Eiren Rain, S.J. Remington, SlimeVR contributors
+    Copyright (c) 2021 Eiren Rain, S.J. Remington & SlimeVR contributors
+
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"), to deal
     in the Software without restriction, including without limitation the rights
@@ -32,14 +33,13 @@
 #include "dmpmag.h"
 #endif
 
+#if defined(_MAHONY_H_) || defined(_MADGWICK_H_)
 constexpr float gscale = (250. / 32768.0) * (PI / 180.0); //gyro default 250 LSB per d/s -> rad/s
+#endif
 
-#define SKIP_CALC_MAG_INTERVAL 10
-#define MAG_CORR_RATIO 0.2
+#define MAG_CORR_RATIO 0.02
 
 void MPU9250Sensor::motionSetup() {
-    DeviceConfig * const config = getConfigPtr();
-    calibration = &config->calibration[sensorId];
     // initialize device
     imu.initialize(addr);
     if(!imu.testConnection()) {
@@ -68,6 +68,27 @@ void MPU9250Sensor::motionSetup() {
             startCalibration(0);
         }
     }
+
+    // Initialize the configuration
+    {
+        SlimeVR::Configuration::CalibrationConfig sensorCalibration = configuration.getCalibration(sensorId);
+        // If no compatible calibration data is found, the calibration data will just be zero-ed out
+        switch (sensorCalibration.type) {
+        case SlimeVR::Configuration::CalibrationConfigType::MPU9250:
+            m_Calibration = sensorCalibration.data.mpu9250;
+            break;
+
+        case SlimeVR::Configuration::CalibrationConfigType::NONE:
+            m_Logger.warn("No calibration data found for sensor %d, ignoring...", sensorId);
+            m_Logger.info("Calibration is advised");
+            break;
+
+        default:
+            m_Logger.warn("Incompatible calibration data found for sensor %d, ignoring...", sensorId);
+            m_Logger.info("Calibration is advised");
+        }
+    }
+
 #if not (defined(_MAHONY_H_) || defined(_MADGWICK_H_))
     devStatus = imu.dmpInitialize();
     if(devStatus == 0){
@@ -121,30 +142,40 @@ void MPU9250Sensor::motionLoop() {
     if(!imu.GetCurrentFIFOPacket(fifoBuffer,imu.dmpGetFIFOPacketSize())) return;
     if(imu.dmpGetQuaternion(&rawQuat, fifoBuffer)) return; // FIFO CORRUPTED
     Quat quat(-rawQuat.y,rawQuat.x,rawQuat.z,rawQuat.w);
-    if(!skipCalcMag){
-        getMPUScaled();
-        if(Mxyz[0]==0.0f && Mxyz[1]==0.0f && Mxyz[2]==0.0f) return;
-        VectorFloat grav;
-        imu.dmpGetGravity(&grav,&rawQuat);
-        float Grav[3]={grav.x,grav.y,grav.z};
-        skipCalcMag=SKIP_CALC_MAG_INTERVAL;
-        if(correction.length_squared()==0.0f) {
-            correction=getCorrection(Grav,Mxyz,quat);
-            if(sensorId) skipCalcMag=SKIP_CALC_MAG_INTERVAL/2;
+
+    getMPUScaled();
+
+    if (Mxyz[0] == 0.0f && Mxyz[1] == 0.0f && Mxyz[2] == 0.0f) {
+        return;
+    }
+
+    VectorFloat grav;
+    imu.dmpGetGravity(&grav, &rawQuat);
+
+    float Grav[] = {grav.x, grav.y, grav.z};
+
+    if (correction.length_squared() == 0.0f) {
+        correction = getCorrection(Grav, Mxyz, quat);
+    } else {
+        Quat newCorr = getCorrection(Grav, Mxyz, quat);
+
+        if(!__isnanf(newCorr.w)) {
+            correction = correction.slerp(newCorr, MAG_CORR_RATIO);
         }
-        else {
-            Quat newCorr = getCorrection(Grav,Mxyz,quat);
-            if(!__isnanf(newCorr.w)) correction = correction.slerp(newCorr,MAG_CORR_RATIO);
-        }
-    }else skipCalcMag--;
-    quaternion=correction*quat;
+    }
+
+    quaternion = correction * quat;
 #else
     unsigned long now = micros();
     unsigned long deltat = now - last; //seconds since last update
     last = now;
     getMPUScaled();
+    
+    #if defined(_MAHONY_H_))
     mahonyQuaternionUpdate(q, Axyz[0], Axyz[1], Axyz[2], Gxyz[0], Gxyz[1], Gxyz[2], Mxyz[0], Mxyz[1], Mxyz[2], deltat * 1.0e-6);
-    // madgwickQuaternionUpdate(q, Axyz[0], Axyz[1], Axyz[2], Gxyz[0], Gxyz[1], Gxyz[2], Mxyz[0], Mxyz[1], Mxyz[2], deltat * 1.0e-6);
+    #elif defined(_MADGWICK_H_))
+    madgwickQuaternionUpdate(q, Axyz[0], Axyz[1], Axyz[2], Gxyz[0], Gxyz[1], Gxyz[2], Mxyz[0], Mxyz[1], Mxyz[2], deltat * 1.0e-6);
+    #endif
     quaternion.set(-q[2], q[1], q[3], q[0]);
 
 #endif
@@ -170,9 +201,9 @@ void MPU9250Sensor::getMPUScaled()
 #if defined(_MAHONY_H_) || defined(_MADGWICK_H_)
     int16_t ax, ay, az, gx, gy, gz, mx, my, mz;
     imu.getMotion9(&ax, &ay, &az, &gx, &gy, &gz, &mx, &my, &mz);
-    Gxyz[0] = ((float)gx - calibration->G_off[0]) * gscale; //250 LSB(d/s) default to radians/s
-    Gxyz[1] = ((float)gy - calibration->G_off[1]) * gscale;
-    Gxyz[2] = ((float)gz - calibration->G_off[2]) * gscale;
+    Gxyz[0] = ((float)gx - m_Calibration.G_off[0]) * gscale; //250 LSB(d/s) default to radians/s
+    Gxyz[1] = ((float)gy - m_Calibration.G_off[1]) * gscale;
+    Gxyz[2] = ((float)gz - m_Calibration.G_off[2]) * gscale;
 
     Axyz[0] = (float)ax;
     Axyz[1] = (float)ay;
@@ -181,13 +212,13 @@ void MPU9250Sensor::getMPUScaled()
     //apply offsets (bias) and scale factors from Magneto
     #if useFullCalibrationMatrix == true
         for (i = 0; i < 3; i++)
-            temp[i] = (Axyz[i] - calibration->A_B[i]);
-        Axyz[0] = calibration->A_Ainv[0][0] * temp[0] + calibration->A_Ainv[0][1] * temp[1] + calibration->A_Ainv[0][2] * temp[2];
-        Axyz[1] = calibration->A_Ainv[1][0] * temp[0] + calibration->A_Ainv[1][1] * temp[1] + calibration->A_Ainv[1][2] * temp[2];
-        Axyz[2] = calibration->A_Ainv[2][0] * temp[0] + calibration->A_Ainv[2][1] * temp[1] + calibration->A_Ainv[2][2] * temp[2];
+            temp[i] = (Axyz[i] - m_Calibration.A_B[i]);
+        Axyz[0] = m_Calibration.A_Ainv[0][0] * temp[0] + m_Calibration.A_Ainv[0][1] * temp[1] + m_Calibration.A_Ainv[0][2] * temp[2];
+        Axyz[1] = m_Calibration.A_Ainv[1][0] * temp[0] + m_Calibration.A_Ainv[1][1] * temp[1] + m_Calibration.A_Ainv[1][2] * temp[2];
+        Axyz[2] = m_Calibration.A_Ainv[2][0] * temp[0] + m_Calibration.A_Ainv[2][1] * temp[1] + m_Calibration.A_Ainv[2][2] * temp[2];
     #else
         for (i = 0; i < 3; i++)
-            Axyz[i] = (Axyz[i] - calibration->A_B[i]);
+            Axyz[i] = (Axyz[i] - m-Calibration.A_B[i]);
     #endif
 
 #else
@@ -205,13 +236,13 @@ void MPU9250Sensor::getMPUScaled()
     //apply offsets and scale factors from Magneto
     #if useFullCalibrationMatrix == true
         for (i = 0; i < 3; i++)
-            temp[i] = (Mxyz[i] - calibration->M_B[i]);
-        Mxyz[0] = calibration->M_Ainv[0][0] * temp[0] + calibration->M_Ainv[0][1] * temp[1] + calibration->M_Ainv[0][2] * temp[2];
-        Mxyz[1] = calibration->M_Ainv[1][0] * temp[0] + calibration->M_Ainv[1][1] * temp[1] + calibration->M_Ainv[1][2] * temp[2];
-        Mxyz[2] = calibration->M_Ainv[2][0] * temp[0] + calibration->M_Ainv[2][1] * temp[1] + calibration->M_Ainv[2][2] * temp[2];
+            temp[i] = (Mxyz[i] - m_Calibration.M_B[i]);
+        Mxyz[0] = m_Calibration.M_Ainv[0][0] * temp[0] + m_Calibration.M_Ainv[0][1] * temp[1] + m_Calibration.M_Ainv[0][2] * temp[2];
+        Mxyz[1] = m_Calibration.M_Ainv[1][0] * temp[0] + m_Calibration.M_Ainv[1][1] * temp[1] + m_Calibration.M_Ainv[1][2] * temp[2];
+        Mxyz[2] = m_Calibration.M_Ainv[2][0] * temp[0] + m_Calibration.M_Ainv[2][1] * temp[1] + m_Calibration.M_Ainv[2][2] * temp[2];
     #else
         for (i = 0; i < 3; i++)
-            Mxyz[i] = (Mxyz[i] - calibration->M_B[i]);
+            Mxyz[i] = (Mxyz[i] - m_Calibration.M_B[i]);
     #endif
 }
 
@@ -220,7 +251,7 @@ void MPU9250Sensor::startCalibration(int calibrationType) {
 #if not (defined(_MAHONY_H_) || defined(_MADGWICK_H_))
     // with DMP, we just need mag data
     constexpr int calibrationSamples = 300;
-    DeviceConfig *config = getConfigPtr();
+
     // Blink calibrating led before user should rotate the sensor
     m_Logger.info("Gently rotate the device while it's gathering magnetometer data");
     ledManager.pattern(15, 300, 3000/310);
@@ -245,19 +276,18 @@ void MPU9250Sensor::startCalibration(int calibrationType) {
     m_Logger.debug("[INFO] Magnetometer calibration matrix:");
     m_Logger.debug("{");
     for (int i = 0; i < 3; i++) {
-        config->calibration[sensorId].M_B[i] = M_BAinv[0][i];
-        config->calibration[sensorId].M_Ainv[0][i] = M_BAinv[1][i];
-        config->calibration[sensorId].M_Ainv[1][i] = M_BAinv[2][i];
-        config->calibration[sensorId].M_Ainv[2][i] = M_BAinv[3][i];
+        m_Calibration.M_B[i] = M_BAinv[0][i];
+        m_Calibration.M_Ainv[0][i] = M_BAinv[1][i];
+        m_Calibration.M_Ainv[1][i] = M_BAinv[2][i];
+        m_Calibration.M_Ainv[2][i] = M_BAinv[3][i];
         m_Logger.debug("  %f, %f, %f, %f", M_BAinv[0][i], M_BAinv[1][i], M_BAinv[2][i], M_BAinv[3][i]);
     }
     m_Logger.debug("}");
 
-#elif
+#else
 
     m_Logger.debug("Gathering raw data for device calibration...");
     constexpr int calibrationSamples = 300;
-    DeviceConfig *config = getConfigPtr();
     // Reset values
     Gxyz[0] = 0;
     Gxyz[1] = 0;
@@ -283,9 +313,9 @@ void MPU9250Sensor::startCalibration(int calibrationType) {
 #endif
 
     Network::sendRawCalibrationData(Gxyz, CALIBRATION_TYPE_EXTERNAL_GYRO, 0);
-    config->calibration[sensorId].G_off[0] = Gxyz[0];
-    config->calibration[sensorId].G_off[1] = Gxyz[1];
-    config->calibration[sensorId].G_off[2] = Gxyz[2];
+    m_Calibration.G_off[0] = Gxyz[0];
+    m_Calibration.G_off[1] = Gxyz[1];
+    m_Calibration.G_off[2] = Gxyz[2];
 
     // Blink calibrating led before user should rotate the sensor
     m_Logger.info("Gently rotate the device while it's gathering accelerometer and magnetometer data");
@@ -320,29 +350,36 @@ void MPU9250Sensor::startCalibration(int calibrationType) {
     m_Logger.debug("{");
     for (int i = 0; i < 3; i++)
     {
-        config->calibration[sensorId].A_B[i] = A_BAinv[0][i];
-        config->calibration[sensorId].A_Ainv[0][i] = A_BAinv[1][i];
-        config->calibration[sensorId].A_Ainv[1][i] = A_BAinv[2][i];
-        config->calibration[sensorId].A_Ainv[2][i] = A_BAinv[3][i];
+        m_Calibration.A_B[i] = A_BAinv[0][i];
+        m_Calibration.A_Ainv[0][i] = A_BAinv[1][i];
+        m_Calibration.A_Ainv[1][i] = A_BAinv[2][i];
+        m_Calibration.A_Ainv[2][i] = A_BAinv[3][i];
         m_Logger.debug("  %f, %f, %f, %f", A_BAinv[0][i], A_BAinv[1][i], A_BAinv[2][i], A_BAinv[3][i]);
     }
     m_Logger.debug("}");
     m_Logger.debug("[INFO] Magnetometer calibration matrix:");
     m_Logger.debug("{");
     for (int i = 0; i < 3; i++) {
-        config->calibration[sensorId].M_B[i] = M_BAinv[0][i];
-        config->calibration[sensorId].M_Ainv[0][i] = M_BAinv[1][i];
-        config->calibration[sensorId].M_Ainv[1][i] = M_BAinv[2][i];
-        config->calibration[sensorId].M_Ainv[2][i] = M_BAinv[3][i];
+        m_Calibration.M_B[i] = M_BAinv[0][i];
+        m_Calibration.M_Ainv[0][i] = M_BAinv[1][i];
+        m_Calibration.M_Ainv[1][i] = M_BAinv[2][i];
+        m_Calibration.M_Ainv[2][i] = M_BAinv[3][i];
         m_Logger.debug("  %f, %f, %f, %f", M_BAinv[0][i], M_BAinv[1][i], M_BAinv[2][i], M_BAinv[3][i]);
     }
     m_Logger.debug("}");
 #endif
 
-    m_Logger.debug("Now Saving EEPROM");
-    setConfig(*config);
+    m_Logger.debug("Saving the calibration data");
+
+    SlimeVR::Configuration::CalibrationConfig calibration;
+    calibration.type = SlimeVR::Configuration::CalibrationConfigType::MPU9250;
+    calibration.data.mpu9250 = m_Calibration;
+    configuration.setCalibration(sensorId, calibration);
+    configuration.save();
+
     ledManager.off();
     Network::sendCalibrationFinished(CALIBRATION_TYPE_EXTERNAL_ALL, 0);
-    m_Logger.debug("Finished Saving EEPROM");
+    m_Logger.debug("Saved the calibration data");
+
     m_Logger.info("Calibration data gathered");
 }

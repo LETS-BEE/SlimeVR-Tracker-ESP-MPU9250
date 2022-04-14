@@ -26,9 +26,6 @@
 #include <ICM_20948.h>
 #include "sensor.h"
 #include <arduino-timer.h> // Used for periodically saving bias
-#ifdef ESP32
-#include <Preferences.h> // ICM bias saving. ESP8266 use eprom
-#endif
 
 class ICM20948Sensor : public Sensor
 {
@@ -36,7 +33,12 @@ public:
     ICM20948Sensor(uint8_t id, uint8_t address, float rotation) : Sensor("ICM20948Sensor", IMU_ICM20948, id, address, rotation) {}
     ~ICM20948Sensor() override = default;
     void motionSetup() override final;
+    void postSetup() override {
+        this->lastData = millis();
+    }
+
     void motionLoop() override final;
+
     void sendData() override final;
     void startCalibration(int calibrationType) override final;
     void save_bias(bool repeat);
@@ -51,14 +53,11 @@ private:
     ICM_20948_Device_t pdev;
     icm_20948_DMP_data_t dmpData{};
 
+    SlimeVR::Configuration::ICM20948CalibrationConfig m_Calibration;
+
 #define OVERRIDEDMPSETUP true
-#ifdef ESP32
-    Preferences prefs;
+
     Timer<> timer = timer_create_default();
-#endif
-#ifdef ESP8266
-    Timer<> timer = timer_create_default();
-#endif
     // TapDetector tapDetector;
 };
 
