@@ -37,7 +37,7 @@
 constexpr float gscale = (250. / 32768.0) * (PI / 180.0); //gyro default 250 LSB per d/s -> rad/s
 #endif
 
-#define MAG_CORR_RATIO 0.02
+#define MAG_CORR_RATIO 0.01
 
 void MPU9250Sensor::motionSetup() {
     // initialize device
